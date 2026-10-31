@@ -1,0 +1,186 @@
+bundle:
+  name: asset_api-data-pipelines
+workspace:
+  host: https://workspace.example.invalid
+permissions:
+  - level: CAN_MANAGE
+    user_name: contributor@example.com
+  - level: CAN_MANAGE
+    user_name: contributor@example.com
+variables:
+  env:
+    default: dev
+  uc_catalog:
+    default: asset_api_preprod_3_gold
+  uc_schema:
+    default: master_data_webapp
+  forced_tables_1:
+    default: "country_wapp,data_domain_wapp,gbu_wapp,global_finance_wapp,global_technology_wapp,scenario_wapp,signal_wapp,unit_status_wapp,version_wapp"
+  forced_tables_2:
+    default: "version_scenario_life_time_wapp,plant_wapp,signal_life_time_wapp,unit_wapp"
+  alert_quartz_cron_expression:
+    description: >-
+      Vérification horaire (pipeline-1/-2 sont event-driven, pas de cron ;
+      pg-kpi-data-to-uc-delta-table tourne à minute 0 chaque heure). Décalée
+      de 15 min pour laisser les jobs terminer.
+    default: "0 15 * * * ?"
+  alert_lookback_minutes:
+    description: >-
+      Fenêtre de recherche des échecs, > à l'intervalle entre deux checks
+      (1h) pour ne rien manquer entre deux exécutions de l'alerte.
+    default: 90
+  teams_alert_destination_id:
+    description: notification destination Email vers le canal Teams asset_api
+    lookup:
+      notification_destination: teams-asset_api-alerts
+  alert_warehouse_id:
+    lookup:
+      warehouse: asset_api_warehouse
+  alert_pause_status:
+    description: PAUSED partout sauf en ppr
+    default: PAUSED
+resources:
+  jobs:
+# Job 1 — Sync dimensions (tables sans FK) UC → RDS
+    master-data-to-rds-pipeline-1:
+      name: "asset_api-master-data-to-rds-pipeline-1-${bundle.target}"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      trigger:
+        pause_status: UNPAUSED
+        table_update:
+          condition: ANY_UPDATED
+          table_names:
+            - "${var.uc_catalog}.${var.uc_schema}.country_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.data_domain_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.gbu_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.global_finance_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.global_technology_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.scenario_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.signal_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.unit_status_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.version_wapp"
+      tasks:
+        - task_key: sync_uc_to_rds
+          notebook_task:
+            notebook_path: ./main_sync_delta_to_rds.py
+            base_parameters:
+              FORCED_TABLES: "${var.forced_tables_1}"
+              ENV: ${var.env}
+# Job 2 — Sync tables avec FK (plant, unit, exercise, etc.) UC → RDS
+    master-data-to-rds-pipeline-2:
+      name: "asset_api-master-data-to-rds-pipeline-2-${bundle.target}"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      trigger:
+        pause_status: UNPAUSED
+        table_update:
+          condition: ANY_UPDATED
+          table_names:
+            - "${var.uc_catalog}.${var.uc_schema}.signal_life_time_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.version_scenario_life_time_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.plant_wapp"
+            - "${var.uc_catalog}.${var.uc_schema}.unit_wapp"
+      tasks:
+        - task_key: sync_uc_to_rds_2
+          notebook_task:
+            notebook_path: ./main_sync_delta_to_rds.py
+            base_parameters:
+              FORCED_TABLES: "${var.forced_tables_2}"
+              ENV: ${var.env}
+# Job 3 — Sync KPI data PG → Delta table (toutes les heures)
+    pg-kpi-data-to-uc-delta-table:
+      name: "asset_api-pg-kpi-data-to-uc-delta-table-${bundle.target}"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      schedule:
+        pause_status: UNPAUSED
+        quartz_cron_expression: "0 0 * * * ?"
+        timezone_id: Europe/Paris
+      tasks:
+        - task_key: main-pg-kpi-data-to-uc-delta-table
+          notebook_task:
+            notebook_path: ./main_sync_pg_kpi_data_to_delta_table.py
+  alerts:
+# Alerte unique couvrant l'échec de n'importe lequel des 3 jobs asset_api
+    asset_api_failure_alert:
+      display_name: "asset_api-${bundle.target} - Job Failure Alert"
+      parent_path: ${workspace.root_path}
+      warehouse_id: ${var.alert_warehouse_id}
+
+      query_text: >-
+        WITH failed AS (
+          SELECT job_id, run_id, period_start_time, period_end_time, result_state, termination_code
+          FROM system.lakeflow.job_run_timeline
+          WHERE job_id IN (
+              ${resources.jobs.master-data-to-rds-pipeline-1.id},
+              ${resources.jobs.master-data-to-rds-pipeline-2.id},
+              ${resources.jobs.pg-kpi-data-to-uc-delta-table.id}
+            )
+            AND result_state IN ('FAILED', 'ERROR', 'TIMED_OUT', 'CANCELED')
+            AND period_end_time >= current_timestamp() - INTERVAL ${var.alert_lookback_minutes} MINUTES
+        )
+        SELECT job_id, run_id, period_start_time, period_end_time, result_state,
+               termination_code, COUNT(*) OVER () AS n_failed_runs
+        FROM failed ORDER BY period_end_time DESC
+
+      schedule:
+        quartz_cron_schedule: ${var.alert_quartz_cron_expression}
+        timezone_id: Europe/Paris
+        pause_status: ${var.alert_pause_status}
+
+      custom_summary: >-
+        🔴 [${bundle.target}] asset_api — un ou plusieurs jobs ont échoué — {{QUERY_RESULT_VALUE}} run(s) en échec
+
+      custom_description: >-
+        <p>Un ou plusieurs jobs Databricks du bundle <strong>asset_api-data-pipelines-${bundle.target}</strong>
+        (master-data-to-rds-pipeline-1, master-data-to-rds-pipeline-2, pg-kpi-data-to-uc-delta-table)
+        ont échoué. {{QUERY_RESULT_VALUE}} run(s) en échec détecté(s) :</p>
+        {{QUERY_RESULT_TABLE}}
+        <p><a href="{{ALERT_URL}}">Voir l'alerte</a> &nbsp;|&nbsp;
+        <a href="{{QUERY_URL}}">Voir la requête</a></p>
+
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          name: n_failed_runs
+        threshold:
+          value:
+            double_value: 0
+        empty_result_state: OK
+        notification:
+          notify_on_ok: false
+          retrigger_seconds: 0
+          subscriptions:
+            - destination_id: ${var.teams_alert_destination_id}
+targets:
+  dev:
+    workspace:
+      host: https://workspace.example.invalid
+    variables:
+      env: dev
+      uc_catalog: asset_api_preprod_3_gold
+      uc_schema: master_data_webapp
+    resources:
+      jobs:
+        master-data-to-rds-pipeline-1:
+          trigger:
+            pause_status: UNPAUSED
+        master-data-to-rds-pipeline-2:
+          trigger:
+            pause_status: UNPAUSED
+        pg-kpi-data-to-uc-delta-table:
+          schedule:
+            pause_status: UNPAUSED
+  ppr:
+    default: true
+    workspace:
+      host: https://workspace.example.invalid
+    variables:
+      env: noprod
+      uc_catalog: asset_api_preprod_3_gold
+      uc_schema: master_data_webapp
+      alert_pause_status: UNPAUSED
